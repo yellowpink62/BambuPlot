@@ -722,6 +722,7 @@ footer a:hover{text-decoration:underline;}
             <div class="field"><label>X</label><input type="number" id="offsetX" step="0.5" value="0"></div>
             <div class="field"><label>Y</label><input type="number" id="offsetY" step="0.5" value="0"></div>
           </div>
+          <p class="help-note">How far the pen tip sits from the nozzle on the print head. Positive X = pen to the right of the nozzle, positive Y = pen toward the back. Enter the distance as measured — the drawing is shifted the other way to compensate.</p>
         </div>
         <label class="checkbox-row"><input type="checkbox" id="homeCheck" checked> Home all axes (G28) at start</label>
         <label class="checkbox-row" id="homePauseRow"><input type="checkbox" id="homePauseCheck"> &nbsp;&nbsp;↳ Dwell after homing — <input type="number" id="homePauseSec" value="30" min="1" max="300" step="1" style="width:52px;padding:3px 5px;"> s (G4 — time to clip on the pen)</label>
@@ -1795,7 +1796,27 @@ function parseSVGText(text, name){
     if(out.length>=2){ strokes.push(out); closed.push(s.closed); }
   }
   if(!strokes.length) throw new Error('No drawable paths found in this SVG.');
-  return {name, strokes, closed, unitW, unitH};
+  // Drop duplicate contours. SVGs often carry the same outline twice (e.g. a
+  // filled shape plus a stroked copy on top, or a path echoed in a <use>),
+  // which would otherwise plot as a double line. Match by start point, end
+  // point and total length, ignoring tiny coordinate noise.
+  const keptStrokes=[], keptClosed=[], keptLen=[];
+  for(let i=0;i<strokes.length;i++){
+    const st=strokes[i];
+    let len=0;
+    for(let k=1;k<st.length;k++) len+=Math.hypot(st[k].x-st[k-1].x, st[k].y-st[k-1].y);
+    const a=st[0], b=st[st.length-1];
+    let dup=false;
+    for(let j=0;j<keptStrokes.length;j++){
+      if(Math.abs(len-keptLen[j])>0.15) continue;
+      const st2=keptStrokes[j];
+      if(Math.abs(a.x-st2[0].x)>0.05||Math.abs(a.y-st2[0].y)>0.05) continue;
+      if(Math.abs(b.x-st2[st2.length-1].x)>0.05||Math.abs(b.y-st2[st2.length-1].y)>0.05) continue;
+      dup=true; break;
+    }
+    if(!dup){ keptStrokes.push(st); keptClosed.push(closed[i]); keptLen.push(len); }
+  }
+  return {name, strokes:keptStrokes, closed:keptClosed, unitW, unitH};
 }
 // Rasterises parsed SVG shapes (filled/closed shapes + all strokes) onto a
 // white canvas so the existing image hatch pipeline can fill them.
@@ -2256,6 +2277,49 @@ function drawBase(){
     ctx.fillText(String(y), 3, mmToPx(y)+9);
   }
   ctx.restore();
+
+  // pen offset guide: shows where the pen tip sits relative to the nozzle
+  // (reference point placed near the front-left corner of the bed)
+  if(pen.offsetX!==0 || pen.offsetY!==0){
+    const nx=15, ny=bedH-15;                       // nozzle marker (design coords)
+    const px=nx+pen.offsetX, py=ny-pen.offsetY;    // pen tip = +X right, +Y back (up)
+    ctx.save();
+    // full-width guide line at the pen tip's Y, in the nozzle's travel direction (X)
+    ctx.setLineDash([2,5]);
+    ctx.strokeStyle='rgba(232,99,28,0.45)';
+    ctx.lineWidth=1;
+    ctx.beginPath();
+    ctx.moveTo(0, mmToPx(py));
+    ctx.lineTo(mmToPx(bedW), mmToPx(py));
+    ctx.stroke();
+    // full-height guide line at the pen tip's X (bed's Y axis / front-back direction)
+    ctx.beginPath();
+    ctx.moveTo(mmToPx(px), 0);
+    ctx.lineTo(mmToPx(px), mmToPx(bedH));
+    ctx.stroke();
+    ctx.setLineDash([3,3]);
+    ctx.strokeStyle='rgba(232,99,28,0.85)';
+    ctx.lineWidth=1.2;
+    ctx.beginPath();
+    ctx.moveTo(mmToPx(nx), mmToPx(ny));
+    ctx.lineTo(mmToPx(px), mmToPx(py));
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.strokeStyle='rgba(0,0,0,0.55)';
+    ctx.beginPath();
+    ctx.moveTo(mmToPx(nx)-4, mmToPx(ny)); ctx.lineTo(mmToPx(nx)+4, mmToPx(ny));
+    ctx.moveTo(mmToPx(nx), mmToPx(ny)-4); ctx.lineTo(mmToPx(nx), mmToPx(ny)+4);
+    ctx.stroke();
+    ctx.fillStyle='rgba(0,0,0,0.6)';
+    ctx.font='9px JetBrains Mono, monospace';
+    ctx.fillText('nozzle', mmToPx(nx)+5, mmToPx(ny)+3);
+    ctx.fillStyle='#e8631c';
+    ctx.beginPath();
+    ctx.arc(mmToPx(px), mmToPx(py), 3.5, 0, Math.PI*2);
+    ctx.fill();
+    ctx.fillText('pen tip line', mmToPx(px)+5, mmToPx(py)+3);
+    ctx.restore();
+  }
 
   // empty hint
   if(items.length===0){
@@ -3316,8 +3380,8 @@ function applyLoadedProfile(data){
 
 /* ================= G-CODE GENERATION ================= */
 function toMachine(p){
-  let x = p.x + pen.offsetX;
-  let y = (bedH - p.y) + pen.offsetY;
+  let x = p.x - pen.offsetX;
+  let y = (bedH - p.y) - pen.offsetY;
   if(pen.mirrorX) x = bedW - x;
   if(pen.mirrorY) y = bedH - y;
   return {x,y};
@@ -3721,7 +3785,12 @@ function previewIndexAt(time){
   const dur=cum[idx]-startT;
   return {idx, frac: dur>0?(time-startT)/dur:1};
 }
-function pvMachineToCanvasMm(m){ return {x:m.x, y:bedH-m.y}; }
+function pvMachineToCanvasMm(m){
+  let mx=m.x, my=m.y;
+  if(pen.mirrorX) mx=bedW-mx;
+  if(pen.mirrorY) my=bedH-my;
+  return {x: mx+pen.offsetX, y: bedH-my-pen.offsetY}; // nozzle -> where the pen actually draws
+}
 function pvLerp(a,b,t){ return {x:a.x+(b.x-a.x)*t, y:a.y+(b.y-a.y)*t}; }
 function pvApplyStyle(move){
   ctx.lineJoin='round'; ctx.lineCap='round';
