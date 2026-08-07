@@ -613,16 +613,23 @@ footer a:hover{text-decoration:underline;}
           <label>SVG style</label>
           <select id="svgStyle">
             <option value="outline">Vector outlines (clean pen strokes)</option>
+            <option value="contour">Contour fill (concentric lines matching the shape)</option>
+            <option value="shaded">Shaded (black fills + outline)</option>
             <option value="hatch">Filled (line-hatch)</option>
           </select>
-          <p class="help-note" style="margin-top:6px;">Vector mode traces the actual shapes as single pen strokes — the cleanest result for logos and line art. Filled mode hatches the shapes like a photo.</p>
+          <p class="help-note" style="margin-top:6px;">Vector mode traces the actual shapes as single pen strokes — the cleanest result for logos and line art. Shaded mode draws one clean outline per shape and hatches only the black-filled areas. Filled mode hatches the shapes like a photo.</p>
+          <div class="field" id="shadeSpacingField" style="display:none;">
+            <label>Shading spacing: <span id="shadeSpacingVal">0.2</span> mm</label>
+            <div class="slider-row"><input type="range" id="shadeSpacing" min="0.1" max="1" step="0.1" value="0.2"></div>
+            <p class="help-note" style="margin-top:6px;">Lower = denser/more filled shading; higher = lighter, more drawn-out strokes.</p>
+          </div>
         </div>
-        <div class="field">
+        <div class="field" id="threshField">
           <label>Threshold (darker = more ink): <span id="threshVal">140</span></label>
           <div class="slider-row"><input type="range" id="threshSlider" min="10" max="245" value="140"></div>
         </div>
-        <label class="checkbox-row"><input type="checkbox" id="invertCheck"> Invert</label>
-        <div class="field">
+        <label class="checkbox-row" id="invertField"><input type="checkbox" id="invertCheck"> Invert</label>
+        <div class="field" id="angleField">
           <label>Line fill style</label>
           <select id="imgAngle">
             <option value="0">Horizontal lines</option>
@@ -632,7 +639,7 @@ footer a:hover{text-decoration:underline;}
           </select>
           <label class="checkbox-row"><input type="checkbox" id="imgCross"> Cross-hatch (denser ink)</label>
         </div>
-        <div class="field">
+        <div class="field" id="densityField">
           <label>Line density: <span id="imgDensityVal">4</span> px</label>
           <div class="slider-row"><input type="range" id="imgDensity" min="2" max="10" value="4"></div>
         </div>
@@ -1307,6 +1314,9 @@ function measureTextBlock(fontCss, bold, italic, text, pxSize){
 
 const BASE_RASTER_PX_PER_MM = 14; // raster resolution always scales with the final output size
 const MAX_RASTER_DIM = 2200;      // hard safety cap so huge items can't freeze the tab
+const SHADED_SPACING_FACTOR = 1.0; // shaded SVG mode uses the same line spacing as the "Filled" hatch
+let shadeSpacingMm = 0.2;          // shaded/contour SVG mode: spacing between shading strokes (mm), user-tunable
+const SHADED_MIN_SEG_MM = 0.3;      // shaded SVG mode drops only tiny boundary specks (mm); keeps thin strokes
 
 // Renders text into a raster at a resolution proportional to targetHeightMm,
 // then hatch-fills it. Resolution always scales with the requested size, so
@@ -1745,28 +1755,60 @@ function svgIsHidden(el){
          /display\s*:\s*none/i.test(style) || /visibility\s*:\s*hidden/i.test(style);
 }
 // Walks the SVG DOM, accumulating every shape as a transformed polyline.
+// Shapes are collected into *groups*: each group is one SVG shape element
+// (e.g. one <path>) carrying all of its inner polylines. Keeping the subpaths
+// of a single element together (instead of flattening them) lets the fill step
+// apply the SVG winding rule, so genuine holes/whites inside a path stay white
+// instead of being filled. Each group is tagged `dark` when its fill is black.
 function svgCollectShapes(root){
   const shapes=[];
-  function walk(el, mtx){
+  function cssIsDark(css){
+    if(!css) return false;
+    css=css.trim().toLowerCase();
+    if(css==='none'||css==='transparent'||css==='currentcolor') return false;
+    if(css==='black') return true;
+    if(css==='white') return false;
+    let r,g,b;
+    if(css[0]==='#'){
+      let h=css.slice(1);
+      if(h.length===3) h=h.split('').map(c=>c+c).join('');
+      const n=parseInt(h,16); if(!isFinite(n)) return false;
+      r=(n>>16)&255; g=(n>>8)&255; b=n&255;
+    } else {
+      const m=/rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)/.exec(css);
+      if(!m) return true; // unknown named colour -> treat as dark
+      r=+m[1]; g=+m[2]; b=+m[3];
+    }
+    return (r+g+b)/3 < 128;
+  }
+  function fillOf(el, fallback){
+    let v=el.getAttribute('fill');
+    const st=el.getAttribute('style')||'';
+    const sm=/fill\s*:\s*([^;]+)/i.exec(st);
+    if(sm) v=sm[1].trim();
+    if(!v||v==='inherit'||v==='all') return fallback;
+    return v;
+  }
+  function walk(el, mtx, parentFill){
     for(const child of el.children){
       if(svgIsHidden(child)) continue;
       const tag=child.tagName.toLowerCase();
       const childMtx=svgMtxMul(mtx, svgParseTransform(child.getAttribute('transform')));
-      if(tag==='g'||tag==='a'||tag==='switch'||tag==='symbol'||tag==='svg'){
-        walk(child, childMtx);
-        continue;
-      }
+      const fill=fillOf(child,parentFill);
+      if(tag==='g'||tag==='a'||tag==='switch'||tag==='symbol'||tag==='svg'){ walk(child, childMtx, fill); continue; }
       if(tag==='defs'||tag==='clipPath'||tag==='mask'||tag==='pattern'||tag==='image'||tag==='text'||tag==='title'||tag==='desc'||tag==='metadata') continue;
       const subs=svgShapeToShapes(child);
       if(subs){
+        const polys=[];
         for(const s of subs){
           const poly=s.poly.map(p=>svgMtxPoint(childMtx,p));
-          if(poly.length>=2) shapes.push({poly, closed:s.closed});
+          if(poly.length>=2) polys.push({poly, closed:s.closed});
         }
+        if(polys.length) shapes.push({dark: cssIsDark(fill), polys});
       }
     }
   }
-  walk(root, svgParseTransform(root.getAttribute('transform')));
+  walk(root, svgParseTransform(root.getAttribute('transform')), root.getAttribute('fill')||'#000000');
   return shapes;
 }
 // Parses raw SVG text into normalized strokes (bbox moved to 0,0) with
@@ -1779,28 +1821,43 @@ function parseSVGText(text, name){
   const raw=svgCollectShapes(root);
   if(!raw.length) throw new Error('No drawable paths found in this SVG.');
   let minX=Infinity,minY=Infinity,maxX=-Infinity,maxY=-Infinity;
-  for(const s of raw) for(const p of s.poly){
+  for(const s of raw) for(const sp of s.polys) for(const p of sp.poly){
     if(p.x<minX)minX=p.x; if(p.y<minY)minY=p.y;
     if(p.x>maxX)maxX=p.x; if(p.y>maxY)maxY=p.y;
   }
   if(!isFinite(minX)){ minX=0;minY=0;maxX=1;maxY=1; }
   const unitW=Math.max(1,maxX-minX), unitH=Math.max(1,maxY-minY);
-  const strokes=[], closed=[];
+  // Normalise the collected groups (bbox to 0,0). `groups` keeps each shape's
+  // inner subpaths together so holes / winding survive the fill step.
+  const groups=[];
   for(const s of raw){
-    const out=[];
-    for(const p of s.poly){
-      const q={x:p.x-minX, y:p.y-minY};
-      const last=out[out.length-1];
-      if(!last||Math.abs(last.x-q.x)>1e-6||Math.abs(last.y-q.y)>1e-6) out.push(q);
+    const polys=[];
+    for(const s2 of s.polys){
+      const out=[];
+      for(const p of s2.poly){
+        const q={x:p.x-minX, y:p.y-minY};
+        const last=out[out.length-1];
+        if(!last||Math.abs(last.x-q.x)>1e-6||Math.abs(last.y-q.y)>1e-6) out.push(q);
+      }
+      if(out.length>=2) polys.push({poly:out, closed:s2.closed});
     }
-    if(out.length>=2){ strokes.push(out); closed.push(s.closed); }
+    if(polys.length) groups.push({dark:s.dark, polys});
+  }
+  if(!groups.length) throw new Error('No drawable paths found in this SVG.');
+  const strokes=[], closed=[], rawDark=[];
+  for(const g of groups){
+    for(const sp of g.polys){
+      strokes.push(sp.poly);
+      closed.push(sp.closed);
+      rawDark.push(g.dark);
+    }
   }
   if(!strokes.length) throw new Error('No drawable paths found in this SVG.');
   // Drop duplicate contours. SVGs often carry the same outline twice (e.g. a
   // filled shape plus a stroked copy on top, or a path echoed in a <use>),
   // which would otherwise plot as a double line. Match by start point, end
   // point and total length, ignoring tiny coordinate noise.
-  const keptStrokes=[], keptClosed=[], keptLen=[];
+  const keptStrokes=[], keptClosed=[], keptLen=[], keptDark=[];
   for(let i=0;i<strokes.length;i++){
     const st=strokes[i];
     let len=0;
@@ -1814,38 +1871,215 @@ function parseSVGText(text, name){
       if(Math.abs(b.x-st2[st2.length-1].x)>0.05||Math.abs(b.y-st2[st2.length-1].y)>0.05) continue;
       dup=true; break;
     }
-    if(!dup){ keptStrokes.push(st); keptClosed.push(closed[i]); keptLen.push(len); }
+    if(!dup){ keptStrokes.push(st); keptClosed.push(closed[i]); keptLen.push(len); keptDark.push(rawDark[i]); }
   }
-  return {name, strokes:keptStrokes, closed:keptClosed, unitW, unitH};
+  return {name, strokes:keptStrokes, closed:keptClosed, dark:keptDark, groups, unitW, unitH};
 }
 // Rasterises parsed SVG shapes (filled/closed shapes + all strokes) onto a
-// white canvas so the existing image hatch pipeline can fill them.
+// white canvas so the existing image hatch pipeline can fill them. Fills are
+// painted per group (all subpaths of a shape element in one path) so the SVG
+// winding rule keeps interior holes white.
 function svgToRasterCanvas(svg){
   const w=Math.max(1,Math.ceil(svg.unitW)), h=Math.max(1,Math.ceil(svg.unitH));
   const c=document.createElement('canvas');
   c.width=w; c.height=h;
   const rctx=c.getContext('2d');
   rctx.fillStyle='#fff'; rctx.fillRect(0,0,w,h);
-  rctx.fillStyle='#000'; rctx.strokeStyle='#000'; rctx.lineWidth=1.5;
+  rctx.fillStyle='#000';
+  svgPaintGroupFills(svg, rctx);
+  rctx.strokeStyle='#000'; rctx.lineWidth=1.5;
   rctx.lineCap='round'; rctx.lineJoin='round';
-  svg.strokes.forEach((poly,i)=>{
+  for(const poly of svg.strokes){
     rctx.beginPath();
     poly.forEach((p,j)=>{ j===0?rctx.moveTo(p.x,p.y):rctx.lineTo(p.x,p.y); });
-    if(svg.closed[i]) rctx.fill();
     rctx.stroke();
-  });
+  }
   return c;
+}
+// Draws the black fill of every group into the given context. Each group is
+// traced as a single compound path (outer loops + inner holes together) so
+// `fill()` resolves holes with the same winding rule the browser uses for SVG.
+function svgPaintGroupFills(svg, ctx){
+  if(!svg.groups || !svg.groups.length) return;
+  for(const g of svg.groups){
+    if(!g.dark) continue;
+    ctx.beginPath();
+    for(const sp of g.polys){
+      if(!sp.closed) continue;
+      sp.poly.forEach((p,j)=>{ j===0?ctx.moveTo(p.x,p.y):ctx.lineTo(p.x,p.y); });
+      ctx.closePath();
+    }
+    ctx.fill();
+  }
+}
+// Rasterises ONLY the black-filled regions of an SVG (no outline strokes) onto
+// a white canvas. Used as the hatch source for shaded mode, so the clean
+// vector outline is drawn separately instead of getting doubled up.
+function svgToFillCanvas(svg){
+  const w=Math.max(1,Math.ceil(svg.unitW)), h=Math.max(1,Math.ceil(svg.unitH));
+  const c=document.createElement('canvas');
+  c.width=w; c.height=h;
+  const rctx=c.getContext('2d');
+  rctx.fillStyle='#fff'; rctx.fillRect(0,0,w,h);
+  rctx.fillStyle='#000';
+  svgPaintGroupFills(svg, rctx);
+  return c;
+}
+// Shaded mode: hatches the black-filled regions through the existing image
+// pipeline, then overlays the single clean vector outline (transformed into
+// the same raster coordinate space) so shapes read clearly. The shading is
+// drawn with sparser line spacing than a full "filled" hatch, so it reads as
+// a light pencil shading instead of a dense printable fill.
+function buildShadedSvgPaths(svg, density, angle, cross, targetHeightMm){
+  // Fixed millimetre spacing between shading strokes (independent of total
+  // size) so the shading reads as clean hand-drawn strokes instead of the dense
+  // dot-matrix fill of the "Filled" hatch. Only tiny boundary specks are dropped.
+  const spacing = Math.max(2, Math.round(BASE_RASTER_PX_PER_MM * shadeSpacingMm));
+  const result=buildShadedSvgFill(svg, spacing, angle, cross, targetHeightMm);
+  const minPx = SHADED_MIN_SEG_MM * BASE_RASTER_PX_PER_MM;
+  const kept=[];
+  for(const p of result.paths){
+    if(p.length>=2 && pathLen(p)>=minPx) kept.push(p);
+  }
+  result.paths=kept;
+  const sx=result.unitW/svg.unitW, sy=result.unitH/svg.unitH;
+  for(const poly of svg.strokes){
+    result.paths.push(poly.map(p=>({x:p.x*sx, y:p.y*sy})));
+  }
+  return result;
+}
+// Hatch-fills only the black SVG regions, using the given line spacing.
+function buildShadedSvgFill(svg, spacing, angle, cross, targetHeightMm){
+  return buildImageRasterPaths(svgToFillCanvas(svg), 128, false, spacing, angle, cross, targetHeightMm);
+}
+// Contour mode: fills each black SVG region with concentric lines that follow
+// the shape, like hatched topographical maps or engraving. Built by rasterising
+// the black fill, eroding the mask inward one ring at a time, and tracing the
+// boundary of every erosion layer — each ring copies the outer contour and
+// shrinks toward the middle until the region gets too thin.
+function buildContourSvgPaths(svg, targetHeightMm){
+  const aspect = svg.unitW/Math.max(1,svg.unitH);
+  let h = clamp(targetHeightMm*BASE_RASTER_PX_PER_MM, 24, MAX_RASTER_DIM);
+  let w = h*aspect;
+  if(w>MAX_RASTER_DIM){ w=MAX_RASTER_DIM; h=w/aspect; }
+  w=Math.max(8,Math.round(w)); h=Math.max(8,Math.round(h));
+  const fillSrc = svgToFillCanvas(svg);           // unitW x unitH
+  const c=document.createElement('canvas'); c.width=w; c.height=h;
+  const ctx=c.getContext('2d');
+  ctx.drawImage(fillSrc,0,0,w,h);
+  const mask = buildMask(ctx,w,h,128,false);      // 1 = ink
+  const spacing = Math.max(1, Math.round(BASE_RASTER_PX_PER_MM * shadeSpacingMm));
+  const rings = contourErosionRings(mask,w,h,spacing);
+  const sx = svg.unitW/w, sy = svg.unitH/h;
+  // The traced contours are 1px staircases; smooth them so they read as smooth
+  // curves (and so G2/G3 arc fitting can kick in) instead of thousands of
+  // 1px G1 hops. Epsilon ~ a few px merges the pixel steps but keeps real
+  // corners, since Douglas-Peucker only drops points within the tolerance.
+  const smoothEps = Math.max(1, BASE_RASTER_PX_PER_MM*0.2);
+  // Rings shorter than this (perimeter, in svg units ~ mm) are specks a ballpoint
+  // pen can't draw — dropping them keeps the fill clean instead of leaving dots.
+  const minRingPx = 2.5 * BASE_RASTER_PX_PER_MM;
+  const paths = [];
+  for(const ring of rings){
+    const sm = simplifyPath(ring, smoothEps);
+    if(sm.length<2) continue;
+    let len=0; for(let i=1;i<sm.length;i++) len+=Math.hypot(sm[i].x-sm[i-1].x, sm[i].y-sm[i-1].y);
+    if(len<minRingPx) continue;
+    paths.push(sm.map(pt=>({x:pt.x*sx, y:pt.y*sy})));
+  }
+  for(const poly of svg.strokes){ if(poly.length>=2) paths.push(poly.map(p=>({x:p.x,y:p.y}))); }
+  return {paths, unitW:svg.unitW, unitH:svg.unitH};
+}
+// Erodes a binary mask inward one ring at a time; every `spacing` rings the
+// boundary of the current mask is traced and collected. Stops when ink is gone.
+function contourErosionRings(mask, w, h, spacing){
+  const out=[];
+  let cur = new Uint8Array(w*h); cur.set(mask);
+  let nxt = new Uint8Array(w*h);
+  const maxIter = Math.max(1, Math.floor(Math.min(w,h)/2)+1);
+  for(let step=1; step<=maxIter; step++){
+    let any=0;
+    for(let y=0;y<h;y++){
+      const row=y*w;
+      for(let x=0;x<w;x++){
+        const idx=row+x;
+        const v = (y>0&&y<h-1&&x>0&&x<w-1 && cur[idx] &&
+                   cur[idx-1]&&cur[idx+1]&&cur[idx-w]&&cur[idx+w]) ?1:0;
+        nxt[idx]=v;
+        if(v) any=1;
+      }
+    }
+    const t=cur; cur=nxt; nxt=t;
+    if(!any) break;
+    if(step%spacing===0){
+      for(const r of traceMaskBoundary(cur,w,h)) if(r.length>=3) out.push(r);
+    }
+  }
+  return out;
+}
+// Traces the boundary of a binary mask as chained polylines. Every unit edge of
+// a foreground pixel that touches background is emitted, then the unit segments
+// are chained end-to-end into closed loops.
+function traceMaskBoundary(mask, w, h){
+  const segs=[];
+  for(let y=0;y<h;y++){
+    for(let x=0;x<w;x++){
+      if(!mask[y*w+x]) continue;
+      if(y===0 || !mask[(y-1)*w+x]) segs.push([{x,y},{x:x+1,y}]);
+      if(y+1>=h || !mask[(y+1)*w+x]) segs.push([{x,y:y+1},{x:x+1,y:y+1}]);
+      if(x===0 || !mask[y*w+x-1]) segs.push([{x,y},{x,y:y+1}]);
+      if(x+1>=w || !mask[y*w+x+1]) segs.push([{x:x+1,y},{x:x+1,y:y+1}]);
+    }
+  }
+  return chainContourSegments(segs);
+}
+function keyOf(p){ return p.x & 0xFFFF | (p.y<<16); }
+function chainContourSegments(segments){
+  const adj = new Map();
+  const addPair=(k,si)=>{ let l=adj.get(k); if(!l){l=[];adj.set(k,l);} l.push(si); };
+  for(let i=0;i<segments.length;i++){
+    const a=segments[i][0], b=segments[i][1];
+    addPair(keyOf(a),i); addPair(keyOf(b),i);
+  }
+  const used = new Uint8Array(segments.length);
+  const chains=[];
+  for(let start=0;start<segments.length;start++){
+    if(used[start]) continue;
+    used[start]=1;
+    const pts=[segments[start][0], segments[start][1]];
+    let cur = keyOf(segments[start][1]);
+    for(let guard=0; guard<segments.length; guard++){
+      const nbrs = adj.get(cur);
+      let nid=-1;
+      if(nbrs){ for(const sid of nbrs){ if(!used[sid]){ nid=sid; break; } } }
+      if(nid<0) break;
+      used[nid]=1;
+      const sa=segments[nid][0], sb=segments[nid][1];
+      if(keyOf(sa)===cur){ pts.push(sb); cur=keyOf(sb); }
+      else{ pts.push(sa); cur=keyOf(sa); }
+    }
+    chains.push(pts);
+  }
+  return chains;
+}
+function pathLen(poly){
+  let l=0;
+  for(let i=1;i<poly.length;i++) l+=Math.hypot(poly[i].x-poly[i-1].x, poly[i].y-poly[i-1].y);
+  return l;
 }
 function buildSvgItem(svg, mode, density, angle, cross){
   const defaultH = 60;
-  if(mode==='hatch'){
-    const result=buildImageRasterPaths(svgToRasterCanvas(svg), 128, false, density, angle, cross, defaultH);
+  if(mode==='hatch'||mode==='shaded'||mode==='contour'){
+    let result;
+    if(mode==='contour') result=buildContourSvgPaths(svg, defaultH);
+    else if(mode==='shaded') result=buildShadedSvgPaths(svg, density, angle, cross, defaultH);
+    else result=buildImageRasterPaths(svgToRasterCanvas(svg), 128, false, density, angle, cross, defaultH);
     if(!result.paths.length){ toast('Nothing to plot — the SVG looks empty. Try outline mode.'); return null; }
     return {
       id:uid(), type:'svg', label:'SVG: '+svg.name,
       paths:result.paths, unitW:result.unitW, unitH:result.unitH,
       x:0,y:0, width:defaultH*(result.unitW/result.unitH), height:defaultH, rotation:0, visible:true,
-      recipe:{kind:'svgHatch', svg, density, angle, cross},
+      recipe:{kind:'svgHatch', svg, density, angle, cross, mode},
     };
   }
   if(!svg.strokes.length){ toast('No drawable vector paths in that SVG.'); return null; }
@@ -2150,7 +2384,9 @@ function regenerateRasterItem(item){
   } else if(r.kind==='3mf'){
     result = build3MFHatchPaths(r.data, r.flipY, r.density, r.angle, r.cross, item.height);
   } else if(r.kind==='svgHatch'){
-    result = buildImageRasterPaths(svgToRasterCanvas(r.svg), 128, false, r.density, r.angle, r.cross, item.height);
+    if(r.mode==='contour') result = buildContourSvgPaths(r.svg, item.height);
+    else if(r.mode==='shaded') result = buildShadedSvgPaths(r.svg, r.density, r.angle, r.cross, item.height);
+    else result = buildImageRasterPaths(svgToRasterCanvas(r.svg), 128, false, r.density, r.angle, r.cross, item.height);
   }
   if(!result || result.paths.length===0) return; // keep existing paths rather than wiping the item
   item.paths = result.paths;
@@ -2278,46 +2514,24 @@ function drawBase(){
   }
   ctx.restore();
 
-  // pen offset guide: shows where the pen tip sits relative to the nozzle
-  // (reference point placed near the front-left corner of the bed)
+// Reachable area: the pen offset shifts the nozzle reach, so a strip along the
+  // front/top and sides of the bed is physically out of reach and would be
+  // clamped in the G-code. Draw the exact reachable rectangle so it's clear
+  // where plots get cut. (y=0 is the bed's front/top of the canvas here.)
   if(pen.offsetX!==0 || pen.offsetY!==0){
-    const nx=15, ny=bedH-15;                       // nozzle marker (design coords)
-    const px=nx+pen.offsetX, py=ny-pen.offsetY;    // pen tip = +X right, +Y back (up)
+    const limX0 = Math.max(0, pen.offsetX);
+    const limX1 = Math.min(bedW, bedW + pen.offsetX);
+    const limY0 = Math.max(0, -pen.offsetY);
+    const limY1 = Math.min(bedH, bedH - pen.offsetY);
     ctx.save();
-    // full-width guide line at the pen tip's Y, in the nozzle's travel direction (X)
-    ctx.setLineDash([2,5]);
-    ctx.strokeStyle='rgba(232,99,28,0.45)';
-    ctx.lineWidth=1;
-    ctx.beginPath();
-    ctx.moveTo(0, mmToPx(py));
-    ctx.lineTo(mmToPx(bedW), mmToPx(py));
-    ctx.stroke();
-    // full-height guide line at the pen tip's X (bed's Y axis / front-back direction)
-    ctx.beginPath();
-    ctx.moveTo(mmToPx(px), 0);
-    ctx.lineTo(mmToPx(px), mmToPx(bedH));
-    ctx.stroke();
-    ctx.setLineDash([3,3]);
-    ctx.strokeStyle='rgba(232,99,28,0.85)';
-    ctx.lineWidth=1.2;
-    ctx.beginPath();
-    ctx.moveTo(mmToPx(nx), mmToPx(ny));
-    ctx.lineTo(mmToPx(px), mmToPx(py));
-    ctx.stroke();
+    ctx.setLineDash([5,4]);
+    ctx.strokeStyle='rgba(20,70,180,0.85)';
+    ctx.lineWidth=1.8;
+    ctx.strokeRect(mmToPx(limX0), mmToPx(limY0), mmToPx(limX1-limX0), mmToPx(limY1-limY0));
     ctx.setLineDash([]);
-    ctx.strokeStyle='rgba(0,0,0,0.55)';
-    ctx.beginPath();
-    ctx.moveTo(mmToPx(nx)-4, mmToPx(ny)); ctx.lineTo(mmToPx(nx)+4, mmToPx(ny));
-    ctx.moveTo(mmToPx(nx), mmToPx(ny)-4); ctx.lineTo(mmToPx(nx), mmToPx(ny)+4);
-    ctx.stroke();
-    ctx.fillStyle='rgba(0,0,0,0.6)';
-    ctx.font='9px JetBrains Mono, monospace';
-    ctx.fillText('nozzle', mmToPx(nx)+5, mmToPx(ny)+3);
-    ctx.fillStyle='#e8631c';
-    ctx.beginPath();
-    ctx.arc(mmToPx(px), mmToPx(py), 3.5, 0, Math.PI*2);
-    ctx.fill();
-    ctx.fillText('pen tip line', mmToPx(px)+5, mmToPx(py)+3);
+    ctx.fillStyle='rgba(20,70,180,0.9)';
+    ctx.font='bold 10px JetBrains Mono, monospace';
+    ctx.fillText('reachable', mmToPx(limX1)-58, mmToPx(limY0)-5);
     ctx.restore();
   }
 
@@ -2737,10 +2951,24 @@ function handleImageFile(file){
         document.getElementById('dropzoneText').textContent = file.name;
         document.getElementById('svgStyleField').style.display='block';
         document.getElementById('addImageBtn').disabled=false;
+        syncStyleOptions();
         updateImagePreview();
       } catch(err){
-        console.error('SVG parse failed', err);
-        toast(err.message || 'Could not read that SVG file.');
+        // An SVG with no vector paths (e.g. a scanned page embedded as an
+        // <image> PNG) can't be traced as outlines. Fall back to rasterising
+        // the whole document and treating it like a normal photo image.
+        const img=new Image();
+        img.onload=()=>{
+          uploadedImg = img;
+          uploadedSvg = null;
+          document.getElementById('svgStyleField').style.display='none';
+          document.getElementById('dropzoneText').textContent = file.name + ' (raster)';
+          document.getElementById('addImageBtn').disabled=false;
+          syncStyleOptions();
+          updateImagePreview();
+        };
+        img.onerror=()=> toast(err.message || 'Could not read that SVG file.');
+        img.src='data:image/svg+xml;charset=utf-8,'+encodeURIComponent(ev.target.result);
       }
     };
     reader.readAsText(file);
@@ -2756,6 +2984,7 @@ function handleImageFile(file){
       document.getElementById('svgStyleField').style.display='none';
       document.getElementById('dropzoneText').textContent = file.name;
       document.getElementById('addImageBtn').disabled=false;
+      syncStyleOptions();
       updateImagePreview();
     };
     img.src = ev.target.result;
@@ -2810,6 +3039,23 @@ document.getElementById('threshSlider').addEventListener('input', e=>{
 document.getElementById('invertCheck').addEventListener('change', updateImagePreview);
 document.getElementById('imgDensity').addEventListener('input', e=>{
   document.getElementById('imgDensityVal').textContent=e.target.value;
+});
+function syncStyleOptions(){
+  const has = uploadedSvg || uploadedImg;
+  const st = uploadedSvg ? document.getElementById('svgStyle').value : null;
+  const on=(id,ok)=>document.getElementById(id).style.display = ok ? 'block' : 'none';
+  on('shadeSpacingField', st==='shaded' || st==='contour');
+  on('threshField', has && !uploadedSvg);
+  on('invertField',  has && !uploadedSvg);
+  on('angleField',   has && (uploadedSvg ? (st!=='outline' && st!=='contour') : true));
+  on('densityField', has && (uploadedSvg ? (st==='hatch') : true));
+}
+syncStyleOptions();
+document.getElementById('svgStyle').addEventListener('change', syncStyleOptions);
+document.getElementById('shadeSpacing').addEventListener('input', e=>{
+  const v = parseFloat(e.target.value);
+  shadeSpacingMm = v;
+  document.getElementById('shadeSpacingVal').textContent = v.toFixed(1);
 });
 document.getElementById('addImageBtn').addEventListener('click', ()=>{
   if(!uploadedImg && !uploadedSvg) return;
